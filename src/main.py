@@ -2,7 +2,7 @@
 """
 =============================================================================
 HFT Order-Book Imbalance Scalping Bot for MEXC
-Version: 1.1.0 - Using Contract/Futures WebSocket
+Version: 2.0.0 - Professional Regime-Aware Strategy
 =============================================================================
 """
 
@@ -40,62 +40,74 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
-    
+
     dry_run: bool = Field(default=True)
     mexc_api_key: str = Field(default="")
     mexc_api_secret: str = Field(default="")
     symbols: str = Field(default="BTC/USDT,ETH/USDT")
-    
-    # Signal thresholds - MEXC 2025 Winning Config
-    imbalance_buy_threshold: float = Field(default=0.70)  # Lower bound for BUY range
-    imbalance_buy_max: float = Field(default=1.35)  # Upper bound - avoid trap zones
-    imbalance_sell_threshold: float = Field(default=0.0)  # Effectively disabled
-    disable_sell: bool = Field(default=True)  # Completely disable SELL signals
-    delta_sigma_threshold: float = Field(default=2.8)
-    speed_multiplier: float = Field(default=2.8)
-    volume_spike_ratio: float = Field(default=1.8)
-    microprice_buy_pct: float = Field(default=0.00035)
-    microprice_sell_pct: float = Field(default=-0.00035)
-    
-    # Spoofing filter
-    spoof_btc_size: float = Field(default=50.0)
-    spoof_eth_size: float = Field(default=1000.0)
+
+    # Signal thresholds - MEXC 2025 Pro Config
+    imbalance_buy_threshold: float = Field(default=0.80)  # Tighter lower bound
+    imbalance_buy_max: float = Field(default=1.40)  # Tighter upper bound
+    imbalance_sell_threshold: float = Field(default=0.0)  # Disabled
+    disable_sell: bool = Field(default=True)  # Long-only strategy
+    delta_sigma_threshold: float = Field(default=2.5)
+    speed_multiplier: float = Field(default=3.0)
+    volume_spike_ratio: float = Field(default=2.0)
+    microprice_buy_pct: float = Field(default=0.0004)
+    microprice_sell_pct: float = Field(default=-0.0004)
+
+    # PRO FILTERS - New in v2.0
+    rate_limit_seconds: float = Field(default=60.0)  # Min seconds between trades per symbol
+    cooldown_losses: int = Field(default=3)  # Consecutive losses before cooldown
+    cooldown_minutes: float = Field(default=10.0)  # Cooldown duration after losses
+    max_spread_pct: float = Field(default=0.05)  # Max spread % for entry (volatility filter)
+    trading_hours_start: int = Field(default=13)  # UTC hour to start trading
+    trading_hours_end: int = Field(default=20)  # UTC hour to stop trading
+    enable_time_filter: bool = Field(default=True)  # Enable/disable time filter
+    min_confidence_score: float = Field(default=60.0)  # Min confidence score (0-100)
+
+    # Spoofing filter - Raised thresholds for quality signals
+    spoof_btc_size: float = Field(default=200.0)  # Doubled from 100
+    spoof_eth_size: float = Field(default=4000.0)  # Doubled from 2000
     spoof_window_ms: int = Field(default=800)
     spoof_block_seconds: int = Field(default=15)
-    
+
     # Execution
-    tp_btc_pct: float = Field(default=0.08)
-    tp_eth_pct: float = Field(default=0.12)
-    sl_pct: float = Field(default=0.04)
-    max_position_lifetime: float = Field(default=4.0)
-    risk_per_trade_pct: float = Field(default=0.5)
-    max_positions_per_pair: int = Field(default=3)
-    
+    tp_btc_pct: float = Field(default=0.04)
+    tp_eth_pct: float = Field(default=0.06)
+    sl_pct: float = Field(default=0.03)  # Tighter stop
+    max_position_lifetime: float = Field(default=12.0)  # Longer for trends
+    risk_per_trade_pct: float = Field(default=0.3)  # Reduced risk
+    max_positions_per_pair: int = Field(default=1)  # Only 1 position at a time
+    use_trailing_stop: bool = Field(default=True)  # Enable trailing stops
+    trailing_stop_pct: float = Field(default=0.02)  # Trail at 0.02%
+
     # Timing
     delta_window_ms: int = Field(default=300)
-    microprice_window_ms: int = Field(default=2000)  # Increased from 200ms for better momentum detection
+    microprice_window_ms: int = Field(default=2000)
     imbalance_speed_window_sec: int = Field(default=5)
     speed_avg_window_sec: int = Field(default=300)
-    
+
     # Network
     ws_ping_interval: int = Field(default=30)
     ws_reconnect_max_delay: int = Field(default=60)
     request_timeout: int = Field(default=10)
     max_retries: int = Field(default=3)
-    
+
     # Logging
     log_level: str = Field(default="INFO")
     log_rotation: str = Field(default="100 MB")
     log_retention: str = Field(default="7 days")
-    bot_version: str = Field(default="1.1.0")
-    
+    bot_version: str = Field(default="2.0.0")
+
     @property
     def symbol_list(self) -> list[str]:
         return [s.strip() for s in self.symbols.split(",") if s.strip()]
-    
+
     def get_tp_pct(self, symbol: str) -> float:
         return self.tp_btc_pct if "BTC" in symbol else self.tp_eth_pct
-    
+
     def get_spoof_size(self, symbol: str) -> float:
         return self.spoof_btc_size if "BTC" in symbol else self.spoof_eth_size
 
@@ -152,11 +164,15 @@ class Position:
     speed_ratio: float = 0.0
     volume_ratio: float = 0.0
     microprice_pct: float = 0.0
+    confidence_score: float = 0.0
     # Market conditions at entry
     spread_at_entry: float = 0.0
     bid_depth: float = 0.0
     ask_depth: float = 0.0
     mid_price: float = 0.0
+    # Trailing stop tracking
+    highest_price: float = 0.0  # Track highest price since entry (for BUY)
+    trailing_sl: float = 0.0  # Current trailing stop level
 
 
 @dataclass
@@ -170,12 +186,20 @@ class SignalMetrics:
     speed_ratio: float = 0.0
     volume_ratio: float = 0.0
     microprice_change_pct: float = 0.0
+    spread_pct: float = 0.0  # Current spread as % of mid price
     buy_signal: bool = False
     sell_signal: bool = False
     spoof_blocked: bool = False
-    
+    confidence_score: float = 0.0  # 0-100 weighted signal strength
+
     buy_confirmations: int = 0
     sell_confirmations: int = 0
+
+    # Filter states
+    rate_limited: bool = False
+    in_cooldown: bool = False
+    outside_hours: bool = False
+    spread_too_wide: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -188,11 +212,17 @@ class SignalMetrics:
             "speed_ratio": round(self.speed_ratio, 2),
             "volume_ratio": round(self.volume_ratio, 2),
             "microprice_change_pct": round(self.microprice_change_pct, 4),
+            "spread_pct": round(self.spread_pct, 4),
             "buy_signal": self.buy_signal,
             "sell_signal": self.sell_signal,
             "spoof_blocked": self.spoof_blocked,
+            "confidence_score": round(self.confidence_score, 1),
             "buy_confirmations": self.buy_confirmations,
             "sell_confirmations": self.sell_confirmations,
+            "rate_limited": self.rate_limited,
+            "in_cooldown": self.in_cooldown,
+            "outside_hours": self.outside_hours,
+            "spread_too_wide": self.spread_too_wide,
         }
 
 
@@ -264,7 +294,7 @@ class SymbolState:
         self.symbol = symbol
         self.settings = settings
         self.orderbook = OrderBook(symbol=symbol)
-        
+
         # Buffers
         self.delta_buffer = TimeSeriesBuffer(settings.delta_window_ms / 1000.0)
         self.delta_30sec_buffer = TimeSeriesBuffer(30.0)
@@ -273,26 +303,33 @@ class SymbolState:
         self.microprice_buffer = TimeSeriesBuffer(settings.microprice_window_ms / 1000.0)
         self.volume_1m_buffer = TimeSeriesBuffer(60.0)
         self.volume_sma_buffer = TimeSeriesBuffer(20 * 60.0)
-        
+
         # Spoofing - now used as CONFIRMATION, not blocking
         self.large_orders: dict[str, LargeOrder] = {}
         self.spoof_confirmed_until: float = 0.0  # Spoof = positive signal window
-        
+
         # Previous state
         self._prev_bid_volume: float = 0.0
         self._prev_ask_volume: float = 0.0
-        
+
         # Market info
         self.tick_size: float = 0.01
         self.step_size: float = 0.0001
         self.min_notional: float = 5.0
-        
+
         # Positions
         self.positions: dict[str, Position] = {}
-        
+
         # Full orderbook for incremental updates
         self._full_bids: dict[float, float] = {}
         self._full_asks: dict[float, float] = {}
+
+        # PRO FILTERS - Rate limiting and cooldown
+        self.last_trade_time: float = 0.0  # Last trade timestamp
+        self.consecutive_losses: int = 0  # Track consecutive losses
+        self.cooldown_until: float = 0.0  # Cooldown end time
+        self.total_trades: int = 0
+        self.winning_trades: int = 0
     
     def update_orderbook_full(self, bids: list, asks: list, timestamp: float) -> None:
         """Full orderbook snapshot."""
@@ -470,59 +507,131 @@ class SymbolState:
     
     def compute_signal(self, now: float) -> SignalMetrics:
         metrics = SignalMetrics(timestamp=now, symbol=self.symbol)
-        
+
+        # Basic metrics
         metrics.weighted_imbalance = self.compute_weighted_imbalance()
         _, metrics.delta_sigma = self.compute_cumulative_delta_sigma(now)
         metrics.cumulative_delta = self.delta_buffer.sum(now)
-        
+
         speed = self.compute_imbalance_speed(now)
         speed_ratio = self.compute_speed_ratio(now)
         metrics.imbalance_speed = speed if speed is not None else 0.0
         metrics.speed_ratio = speed_ratio if speed_ratio is not None else 0.0
         metrics.volume_ratio = self.compute_volume_ratio(now)
-        
+
         microprice = self.compute_microprice_momentum(now)
         metrics.microprice_change_pct = microprice if microprice is not None else 0.0
-        # MEXC 2025: spoof_blocked now means "spoof confirmed" = GOOD for trading
-        metrics.spoof_blocked = now < self.spoof_confirmed_until  # True = spoof recently detected = trade!
 
-        # MEXC 2025 WINNING STRATEGY
-        # Key insight: Only imbalance range 0.70-1.35 is profitable
-        # Extreme imbalances (>1.35 or <0.5) are trap zones - avoid!
-        # SELL signals are ALL losing - disable completely
+        # Spread as percentage of mid price
+        if self.orderbook.mid_price > 0:
+            metrics.spread_pct = (self.orderbook.spread / self.orderbook.mid_price) * 100
+        else:
+            metrics.spread_pct = 999.0
 
-        # BUY allowed only in the winning range (0.70 <= imbalance <= 1.35)
-        buy_in_range = (
-            metrics.weighted_imbalance >= self.settings.imbalance_buy_threshold and
-            metrics.weighted_imbalance <= self.settings.imbalance_buy_max
-        )
+        # Spoof confirmation
+        metrics.spoof_blocked = now < self.spoof_confirmed_until
 
-        # Count confirmations for BUY
+        # =====================================================================
+        # PRO FILTERS - v2.0
+        # =====================================================================
+
+        # 1. RATE LIMITING - Min time between trades
+        time_since_last = now - self.last_trade_time
+        metrics.rate_limited = time_since_last < self.settings.rate_limit_seconds
+
+        # 2. COOLDOWN - After consecutive losses
+        metrics.in_cooldown = now < self.cooldown_until
+
+        # 3. TIME FILTER - Only trade during high-liquidity hours
+        if self.settings.enable_time_filter:
+            current_hour = datetime.now(timezone.utc).hour
+            metrics.outside_hours = not (
+                self.settings.trading_hours_start <= current_hour < self.settings.trading_hours_end
+            )
+        else:
+            metrics.outside_hours = False
+
+        # 4. VOLATILITY FILTER - Spread too wide = choppy market
+        metrics.spread_too_wide = metrics.spread_pct > self.settings.max_spread_pct
+
+        # =====================================================================
+        # CONFIDENCE SCORING (0-100)
+        # Weight signals to create a single quality score
+        # =====================================================================
+        confidence = 0.0
+
+        # Imbalance in sweet spot (0.8-1.4) = 40 points
+        imb = metrics.weighted_imbalance
+        if self.settings.imbalance_buy_threshold <= imb <= self.settings.imbalance_buy_max:
+            # Peak confidence at 1.0-1.1 (neutral with slight bullish)
+            if 0.95 <= imb <= 1.15:
+                confidence += 40
+            elif 0.85 <= imb <= 1.25:
+                confidence += 30
+            else:
+                confidence += 20
+
+        # Delta sigma strength = 20 points
+        if metrics.delta_sigma >= self.settings.delta_sigma_threshold:
+            confidence += 20
+        elif metrics.delta_sigma >= self.settings.delta_sigma_threshold * 0.5:
+            confidence += 10
+
+        # Speed ratio = 15 points
+        if metrics.speed_ratio >= self.settings.speed_multiplier:
+            confidence += 15
+        elif metrics.speed_ratio >= self.settings.speed_multiplier * 0.5:
+            confidence += 7
+
+        # Volume spike = 15 points
+        if metrics.volume_ratio >= self.settings.volume_spike_ratio:
+            confidence += 15
+        elif metrics.volume_ratio >= self.settings.volume_spike_ratio * 0.5:
+            confidence += 7
+
+        # Microprice momentum = 10 points
+        if metrics.microprice_change_pct >= self.settings.microprice_buy_pct:
+            confidence += 10
+        elif metrics.microprice_change_pct >= self.settings.microprice_buy_pct * 0.5:
+            confidence += 5
+
+        metrics.confidence_score = confidence
+
+        # Count confirmations for debugging
         buy_confirmations = sum([
             metrics.delta_sigma >= self.settings.delta_sigma_threshold,
             metrics.speed_ratio >= self.settings.speed_multiplier,
             metrics.volume_ratio >= self.settings.volume_spike_ratio,
             metrics.microprice_change_pct >= self.settings.microprice_buy_pct,
         ])
-
-        # Store confirmation counts in metrics for debugging
         metrics.buy_confirmations = buy_confirmations
-        metrics.sell_confirmations = 0  # SELL disabled
+        metrics.sell_confirmations = 0
 
-        # BUY: Spoof confirmed + Imbalance in winning range + confirmations
+        # =====================================================================
+        # FINAL BUY SIGNAL - All filters must pass
+        # =====================================================================
+        buy_in_range = (
+            metrics.weighted_imbalance >= self.settings.imbalance_buy_threshold and
+            metrics.weighted_imbalance <= self.settings.imbalance_buy_max
+        )
+
         buy_conditions = [
-            metrics.spoof_blocked,  # REQUIRED: Spoof detected
-            buy_in_range,  # REQUIRED: In winning imbalance range (0.70-1.35)
-            buy_confirmations >= 1,  # At least 1 secondary confirmation
-            len(self.positions) < self.settings.max_positions_per_pair,
+            metrics.spoof_blocked,  # Spoof confirmed
+            buy_in_range,  # In winning imbalance range
+            metrics.confidence_score >= self.settings.min_confidence_score,  # Min confidence
+            not metrics.rate_limited,  # Not rate limited
+            not metrics.in_cooldown,  # Not in cooldown
+            not metrics.outside_hours,  # Within trading hours
+            not metrics.spread_too_wide,  # Spread acceptable
+            len(self.positions) < self.settings.max_positions_per_pair,  # Position limit
         ]
 
-        # SELL: COMPLETELY DISABLED (all SELL signals were losing money)
-        sell_conditions = [False]  # Never triggers
+        # SELL disabled
+        sell_conditions = [False]
 
         metrics.buy_signal = all(buy_conditions)
         metrics.sell_signal = False if self.settings.disable_sell else all(sell_conditions)
-        
+
         return metrics
 
 
@@ -865,61 +974,67 @@ class TradingEngine:
         price = state.orderbook.mid_price
         if price == 0:
             return None
-        
+
         elapsed = now - pos.entry_time
         if elapsed >= self.settings.max_position_lifetime:
             return "TIMEOUT"
-        
+
+        # TRAILING STOP LOGIC
+        if self.settings.use_trailing_stop and pos.side == Side.BUY:
+            # Update highest price
+            if price > pos.highest_price:
+                pos.highest_price = price
+                # Update trailing stop
+                trail_pct = self.settings.trailing_stop_pct / 100
+                pos.trailing_sl = price * (1 - trail_pct)
+                # Only update if trailing SL is higher than original SL
+                if pos.trailing_sl > pos.sl_price:
+                    pos.sl_price = pos.trailing_sl
+
         if pos.side == Side.BUY:
             if price >= pos.tp_price:
                 return "TAKE_PROFIT"
             if price <= pos.sl_price:
-                return "STOP_LOSS"
+                return "STOP_LOSS" if pos.trailing_sl == 0 else "TRAILING_STOP"
         else:
             if price <= pos.tp_price:
                 return "TAKE_PROFIT"
             if price >= pos.sl_price:
                 return "STOP_LOSS"
-        
-        metrics = state.compute_signal(now)
-        if pos.side == Side.BUY and metrics.sell_signal:
-            return "REVERSE_SIGNAL"
-        if pos.side == Side.SELL and metrics.buy_signal:
-            return "REVERSE_SIGNAL"
-        
+
         return None
     
     async def _open_position(self, state: SymbolState, side: Side, metrics: SignalMetrics) -> None:
         symbol = state.symbol
         now = time.time()
         ob = state.orderbook
-        
+
         if ob.best_bid == 0 or ob.best_ask == 0:
             return
-        
+
         tick = state.tick_size
         entry_price = ob.best_ask + tick if side == Side.BUY else ob.best_bid - tick
-        
+
         balance = 10000.0 if self.settings.dry_run else await self.exchange.get_usdt_balance()
         risk_usd = balance * (self.settings.risk_per_trade_pct / 100)
         quantity = self.exchange.quantize_amount(symbol, risk_usd / entry_price)
-        
+
         tp_pct = self.settings.get_tp_pct(symbol) / 100
         sl_pct = self.settings.sl_pct / 100
-        
+
         if side == Side.BUY:
             tp_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
         else:
             tp_price = entry_price * (1 - tp_pct)
             sl_price = entry_price * (1 + sl_pct)
-        
+
         tp_price = self.exchange.quantize_price(symbol, tp_price)
         sl_price = self.exchange.quantize_price(symbol, sl_price)
-        
+
         self._position_counter += 1
         pos_id = f"{symbol}_{side.value}_{self._position_counter}"
-        
+
         # Capture market conditions at entry
         bid_depth = sum(size for _, size in ob.bids)
         ask_depth = sum(size for _, size in ob.asks)
@@ -930,14 +1045,21 @@ class TradingEngine:
             entry_time=now, imbalance=metrics.weighted_imbalance,
             delta_sigma=metrics.delta_sigma, speed_ratio=metrics.speed_ratio,
             volume_ratio=metrics.volume_ratio, microprice_pct=metrics.microprice_change_pct,
+            confidence_score=metrics.confidence_score,
             spread_at_entry=ob.spread, bid_depth=bid_depth, ask_depth=ask_depth,
             mid_price=ob.mid_price,
+            highest_price=entry_price,  # Initialize for trailing stop
         )
-        
+
+        # UPDATE RATE LIMIT TIMESTAMP
+        state.last_trade_time = now
+        state.total_trades += 1
+
         if self.settings.dry_run:
             logger.info(
                 f"[DRY_RUN] [{symbol}] OPEN {side.value} {quantity:.6f} @ {entry_price:.2f} "
-                f"| TP: {tp_price:.2f} | SL: {sl_price:.2f} | Imb: {metrics.weighted_imbalance:.2f}"
+                f"| TP: {tp_price:.2f} | SL: {sl_price:.2f} | Imb: {metrics.weighted_imbalance:.2f} "
+                f"| Conf: {metrics.confidence_score:.0f}"
             )
         else:
             order = await self.exchange.place_limit_order(symbol, side, quantity, entry_price)
@@ -945,26 +1067,41 @@ class TradingEngine:
                 position.order_id = order.get("id")
             else:
                 return
-        
+
         state.positions[pos_id] = position
         await self.db.log_signal(position, None, None, None, None, None, self.settings.dry_run)
     
     async def _close_position(self, state: SymbolState, pos_id: str, reason: str) -> None:
         if pos_id not in state.positions:
             return
-        
+
         position = state.positions[pos_id]
         now = time.time()
         exit_price = state.orderbook.mid_price
-        
+
         if position.side == Side.BUY:
             pnl_pct = ((exit_price - position.entry_price) / position.entry_price) * 100
         else:
             pnl_pct = ((position.entry_price - exit_price) / position.entry_price) * 100
-        
+
         pnl_usd = position.quantity * position.entry_price * (pnl_pct / 100)
         duration_ms = int((now - position.entry_time) * 1000)
-        
+
+        # TRACK CONSECUTIVE LOSSES FOR COOLDOWN
+        if pnl_usd > 0:
+            state.consecutive_losses = 0  # Reset on win
+            state.winning_trades += 1
+        else:
+            state.consecutive_losses += 1
+            # Trigger cooldown after X consecutive losses
+            if state.consecutive_losses >= self.settings.cooldown_losses:
+                state.cooldown_until = now + (self.settings.cooldown_minutes * 60)
+                logger.warning(
+                    f"[{position.symbol}] COOLDOWN TRIGGERED - {state.consecutive_losses} losses | "
+                    f"Pausing for {self.settings.cooldown_minutes} min"
+                )
+                state.consecutive_losses = 0  # Reset after triggering
+
         if self.settings.dry_run:
             logger.info(
                 f"[DRY_RUN] [{position.symbol}] CLOSE {position.side.value} @ {exit_price:.2f} "
@@ -973,7 +1110,7 @@ class TradingEngine:
         else:
             close_side = Side.SELL if position.side == Side.BUY else Side.BUY
             await self.exchange.place_market_order(position.symbol, close_side, position.quantity)
-        
+
         await self.db.log_signal(position, exit_price, reason, pnl_usd, pnl_pct, duration_ms, self.settings.dry_run)
         del state.positions[pos_id]
 
@@ -1021,6 +1158,7 @@ class HealthServer:
     
     def _debug_info(self) -> dict:
         now = time.time()
+        current_hour = datetime.now(timezone.utc).hour
         symbols = {}
         for symbol, state in self.states.items():
             ob = state.orderbook
@@ -1030,16 +1168,29 @@ class HealthServer:
                     "best_bid": ob.best_bid,
                     "best_ask": ob.best_ask,
                     "spread": round(ob.spread, 4),
+                    "spread_pct": round(metrics.spread_pct, 4),
                     "mid_price": round(ob.mid_price, 2),
                     "levels": len(ob.bids),
                 },
                 "metrics": metrics.to_dict(),
                 "positions": len(state.positions),
+                "pro_filters": {
+                    "rate_limited": metrics.rate_limited,
+                    "in_cooldown": metrics.in_cooldown,
+                    "outside_hours": metrics.outside_hours,
+                    "spread_too_wide": metrics.spread_too_wide,
+                    "consecutive_losses": state.consecutive_losses,
+                    "last_trade_ago": round(now - state.last_trade_time, 1) if state.last_trade_time > 0 else None,
+                    "total_trades": state.total_trades,
+                    "winning_trades": state.winning_trades,
+                },
             }
         return {
             "version": self.settings.bot_version,
             "mode": "DRY_RUN" if self.settings.dry_run else "LIVE",
             "uptime": round(now - self._start_time, 1),
+            "current_hour_utc": current_hour,
+            "trading_hours": f"{self.settings.trading_hours_start}:00-{self.settings.trading_hours_end}:00 UTC",
             "symbols": symbols,
         }
 
