@@ -267,9 +267,9 @@ class SymbolState:
         self.volume_1m_buffer = TimeSeriesBuffer(60.0)
         self.volume_sma_buffer = TimeSeriesBuffer(20 * 60.0)
         
-        # Spoofing
+        # Spoofing - now used as CONFIRMATION, not blocking
         self.large_orders: dict[str, LargeOrder] = {}
-        self.spoof_block_until: float = 0.0
+        self.spoof_confirmed_until: float = 0.0  # Spoof = positive signal window
         
         # Previous state
         self._prev_bid_volume: float = 0.0
@@ -358,35 +358,42 @@ class SymbolState:
             self.microprice_buffer.add(self.orderbook.mid_price, now)
     
     def _check_spoofing(self, now: float) -> None:
+        """
+        MEXC 2025 strategy: Spoof = CONFIRMATION, not blocking.
+        When whales spoof (large order appears then vanishes),
+        the real move follows 10-15 seconds later.
+        We WANT to trade when spoof is detected.
+        """
         spoof_size = self.settings.get_spoof_size(self.symbol)
         window_sec = self.settings.spoof_window_ms / 1000.0
-        
+
         current_large: set[str] = set()
-        
+
         for price, size in self.orderbook.bids:
             if size >= spoof_size:
                 key = f"bid_{price}"
                 current_large.add(key)
                 if key not in self.large_orders:
                     self.large_orders[key] = LargeOrder(now, "bid", price, size)
-        
+
         for price, size in self.orderbook.asks:
             if size >= spoof_size:
                 key = f"ask_{price}"
                 current_large.add(key)
                 if key not in self.large_orders:
                     self.large_orders[key] = LargeOrder(now, "ask", price, size)
-        
+
         to_remove = []
         for key, order in self.large_orders.items():
             if key not in current_large:
                 if now - order.timestamp <= window_sec:
-                    self.spoof_block_until = now + self.settings.spoof_block_seconds
-                    logger.warning(f"[{self.symbol}] SPOOF DETECTED")
+                    # Spoof detected! This is a POSITIVE signal for trading
+                    self.spoof_confirmed_until = now + self.settings.spoof_block_seconds
+                    logger.info(f"[{self.symbol}] SPOOF CONFIRMED - trade window open for {self.settings.spoof_block_seconds}s")
                 to_remove.append(key)
             elif now - order.timestamp > window_sec:
                 to_remove.append(key)
-        
+
         for key in to_remove:
             del self.large_orders[key]
     
@@ -469,25 +476,26 @@ class SymbolState:
         
         microprice = self.compute_microprice_momentum(now)
         metrics.microprice_change_pct = microprice if microprice is not None else 0.0
-        metrics.spoof_blocked = now < self.spoof_block_until
-        
+        # MEXC 2025: spoof_blocked now means "spoof confirmed" = GOOD for trading
+        metrics.spoof_blocked = now < self.spoof_confirmed_until  # True = spoof recently detected = trade!
+
         buy_conditions = [
             metrics.weighted_imbalance >= self.settings.imbalance_buy_threshold,
             metrics.delta_sigma >= self.settings.delta_sigma_threshold,
             metrics.speed_ratio >= self.settings.speed_multiplier,
             metrics.volume_ratio >= self.settings.volume_spike_ratio,
             metrics.microprice_change_pct >= self.settings.microprice_buy_pct,
-            not metrics.spoof_blocked,
+            metrics.spoof_blocked,  # INVERTED: Now we WANT spoof to be True!
             len(self.positions) < self.settings.max_positions_per_pair,
         ]
-        
+
         sell_conditions = [
             metrics.weighted_imbalance <= self.settings.imbalance_sell_threshold,
             metrics.delta_sigma <= -self.settings.delta_sigma_threshold,
             metrics.speed_ratio <= -self.settings.speed_multiplier,
             metrics.volume_ratio >= self.settings.volume_spike_ratio,
             metrics.microprice_change_pct <= self.settings.microprice_sell_pct,
-            not metrics.spoof_blocked,
+            metrics.spoof_blocked,  # INVERTED: Now we WANT spoof to be True!
             len(self.positions) < self.settings.max_positions_per_pair,
         ]
         
