@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     
     # Timing
     delta_window_ms: int = Field(default=300)
-    microprice_window_ms: int = Field(default=200)
+    microprice_window_ms: int = Field(default=2000)  # Increased from 200ms for better momentum detection
     imbalance_speed_window_sec: int = Field(default=5)
     speed_avg_window_sec: int = Field(default=300)
     
@@ -172,6 +172,9 @@ class SignalMetrics:
     sell_signal: bool = False
     spoof_blocked: bool = False
     
+    buy_confirmations: int = 0
+    sell_confirmations: int = 0
+
     def to_dict(self) -> dict:
         return {
             "timestamp": self.timestamp,
@@ -186,6 +189,8 @@ class SignalMetrics:
             "buy_signal": self.buy_signal,
             "sell_signal": self.sell_signal,
             "spoof_blocked": self.spoof_blocked,
+            "buy_confirmations": self.buy_confirmations,
+            "sell_confirmations": self.sell_confirmations,
         }
 
 
@@ -479,26 +484,46 @@ class SymbolState:
         # MEXC 2025: spoof_blocked now means "spoof confirmed" = GOOD for trading
         metrics.spoof_blocked = now < self.spoof_confirmed_until  # True = spoof recently detected = trade!
 
-        buy_conditions = [
-            metrics.weighted_imbalance >= self.settings.imbalance_buy_threshold,
+        # MEXC 2025 Strategy: Spoof + Imbalance = CORE signal
+        # Other indicators add confirmation but aren't strictly required
+        # This allows trades when the key conditions align
+
+        # Count how many secondary confirmations we have for BUY
+        buy_confirmations = sum([
             metrics.delta_sigma >= self.settings.delta_sigma_threshold,
             metrics.speed_ratio >= self.settings.speed_multiplier,
             metrics.volume_ratio >= self.settings.volume_spike_ratio,
             metrics.microprice_change_pct >= self.settings.microprice_buy_pct,
-            metrics.spoof_blocked,  # INVERTED: Now we WANT spoof to be True!
-            len(self.positions) < self.settings.max_positions_per_pair,
-        ]
+        ])
 
-        sell_conditions = [
-            metrics.weighted_imbalance <= self.settings.imbalance_sell_threshold,
+        # Count how many secondary confirmations we have for SELL
+        sell_confirmations = sum([
             metrics.delta_sigma <= -self.settings.delta_sigma_threshold,
             metrics.speed_ratio <= -self.settings.speed_multiplier,
             metrics.volume_ratio >= self.settings.volume_spike_ratio,
             metrics.microprice_change_pct <= self.settings.microprice_sell_pct,
-            metrics.spoof_blocked,  # INVERTED: Now we WANT spoof to be True!
+        ])
+
+        # Store confirmation counts in metrics for debugging
+        metrics.buy_confirmations = buy_confirmations
+        metrics.sell_confirmations = sell_confirmations
+
+        # BUY: Spoof confirmed + Imbalance bullish + at least 1 confirmation
+        buy_conditions = [
+            metrics.spoof_blocked,  # REQUIRED: Spoof detected
+            metrics.weighted_imbalance >= self.settings.imbalance_buy_threshold,  # REQUIRED: Direction
+            buy_confirmations >= 1,  # At least 1 secondary confirmation
             len(self.positions) < self.settings.max_positions_per_pair,
         ]
-        
+
+        # SELL: Spoof confirmed + Imbalance bearish + at least 1 confirmation
+        sell_conditions = [
+            metrics.spoof_blocked,  # REQUIRED: Spoof detected
+            metrics.weighted_imbalance <= self.settings.imbalance_sell_threshold,  # REQUIRED: Direction
+            sell_confirmations >= 1,  # At least 1 secondary confirmation
+            len(self.positions) < self.settings.max_positions_per_pair,
+        ]
+
         metrics.buy_signal = all(buy_conditions)
         metrics.sell_signal = all(sell_conditions)
         
