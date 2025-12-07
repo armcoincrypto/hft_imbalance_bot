@@ -144,11 +144,17 @@ class Position:
     sl_price: float
     entry_time: float
     order_id: Optional[str] = None
+    # Signal metrics at entry
     imbalance: float = 0.0
     delta_sigma: float = 0.0
     speed_ratio: float = 0.0
     volume_ratio: float = 0.0
     microprice_pct: float = 0.0
+    # Market conditions at entry
+    spread_at_entry: float = 0.0
+    bid_depth: float = 0.0
+    ask_depth: float = 0.0
+    mid_price: float = 0.0
 
 
 @dataclass
@@ -527,15 +533,18 @@ class DatabaseManager:
             """INSERT INTO signals (
                 timestamp, symbol, side, entry_price, exit_price, quantity,
                 tp_price, sl_price, exit_reason, pnl_usd, pnl_pct, duration_ms,
-                imbalance, delta_sigma, speed_ratio, volume_ratio, microprice_pct, dry_run
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                imbalance, delta_sigma, speed_ratio, volume_ratio, microprice_pct,
+                spread_at_entry, bid_depth, ask_depth, mid_price, dry_run
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.now(timezone.utc).isoformat(),
                 position.symbol, position.side.value, position.entry_price,
                 exit_price, position.quantity, position.tp_price, position.sl_price,
                 exit_reason, pnl_usd, pnl_pct, duration_ms,
                 position.imbalance, position.delta_sigma, position.speed_ratio,
-                position.volume_ratio, position.microprice_pct, 1 if dry_run else 0,
+                position.volume_ratio, position.microprice_pct,
+                position.spread_at_entry, position.bid_depth, position.ask_depth,
+                position.mid_price, 1 if dry_run else 0,
             ),
         )
         await self._conn.commit()
@@ -882,12 +891,18 @@ class TradingEngine:
         self._position_counter += 1
         pos_id = f"{symbol}_{side.value}_{self._position_counter}"
         
+        # Capture market conditions at entry
+        bid_depth = sum(size for _, size in ob.bids)
+        ask_depth = sum(size for _, size in ob.asks)
+
         position = Position(
             id=pos_id, symbol=symbol, side=side, entry_price=entry_price,
             quantity=quantity, tp_price=tp_price, sl_price=sl_price,
             entry_time=now, imbalance=metrics.weighted_imbalance,
             delta_sigma=metrics.delta_sigma, speed_ratio=metrics.speed_ratio,
             volume_ratio=metrics.volume_ratio, microprice_pct=metrics.microprice_change_pct,
+            spread_at_entry=ob.spread, bid_depth=bid_depth, ask_depth=ask_depth,
+            mid_price=ob.mid_price,
         )
         
         if self.settings.dry_run:
