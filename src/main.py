@@ -46,14 +46,16 @@ class Settings(BaseSettings):
     mexc_api_secret: str = Field(default="")
     symbols: str = Field(default="BTC/USDT,ETH/USDT")
     
-    # Signal thresholds
-    imbalance_buy_threshold: float = Field(default=1.75)
-    imbalance_sell_threshold: float = Field(default=0.57)
-    delta_sigma_threshold: float = Field(default=3.8)
-    speed_multiplier: float = Field(default=4.2)
-    volume_spike_ratio: float = Field(default=2.7)
-    microprice_buy_pct: float = Field(default=0.04)
-    microprice_sell_pct: float = Field(default=-0.04)
+    # Signal thresholds - MEXC 2025 Winning Config
+    imbalance_buy_threshold: float = Field(default=0.70)  # Lower bound for BUY range
+    imbalance_buy_max: float = Field(default=1.35)  # Upper bound - avoid trap zones
+    imbalance_sell_threshold: float = Field(default=0.0)  # Effectively disabled
+    disable_sell: bool = Field(default=True)  # Completely disable SELL signals
+    delta_sigma_threshold: float = Field(default=2.8)
+    speed_multiplier: float = Field(default=2.8)
+    volume_spike_ratio: float = Field(default=1.8)
+    microprice_buy_pct: float = Field(default=0.00035)
+    microprice_sell_pct: float = Field(default=-0.00035)
     
     # Spoofing filter
     spoof_btc_size: float = Field(default=50.0)
@@ -484,11 +486,18 @@ class SymbolState:
         # MEXC 2025: spoof_blocked now means "spoof confirmed" = GOOD for trading
         metrics.spoof_blocked = now < self.spoof_confirmed_until  # True = spoof recently detected = trade!
 
-        # MEXC 2025 Strategy: Spoof + Imbalance = CORE signal
-        # Other indicators add confirmation but aren't strictly required
-        # This allows trades when the key conditions align
+        # MEXC 2025 WINNING STRATEGY
+        # Key insight: Only imbalance range 0.70-1.35 is profitable
+        # Extreme imbalances (>1.35 or <0.5) are trap zones - avoid!
+        # SELL signals are ALL losing - disable completely
 
-        # Count how many secondary confirmations we have for BUY
+        # BUY allowed only in the winning range (0.70 <= imbalance <= 1.35)
+        buy_in_range = (
+            metrics.weighted_imbalance >= self.settings.imbalance_buy_threshold and
+            metrics.weighted_imbalance <= self.settings.imbalance_buy_max
+        )
+
+        # Count confirmations for BUY
         buy_confirmations = sum([
             metrics.delta_sigma >= self.settings.delta_sigma_threshold,
             metrics.speed_ratio >= self.settings.speed_multiplier,
@@ -496,36 +505,23 @@ class SymbolState:
             metrics.microprice_change_pct >= self.settings.microprice_buy_pct,
         ])
 
-        # Count how many secondary confirmations we have for SELL
-        sell_confirmations = sum([
-            metrics.delta_sigma <= -self.settings.delta_sigma_threshold,
-            metrics.speed_ratio <= -self.settings.speed_multiplier,
-            metrics.volume_ratio >= self.settings.volume_spike_ratio,
-            metrics.microprice_change_pct <= self.settings.microprice_sell_pct,
-        ])
-
         # Store confirmation counts in metrics for debugging
         metrics.buy_confirmations = buy_confirmations
-        metrics.sell_confirmations = sell_confirmations
+        metrics.sell_confirmations = 0  # SELL disabled
 
-        # BUY: Spoof confirmed + Imbalance bullish + at least 1 confirmation
+        # BUY: Spoof confirmed + Imbalance in winning range + confirmations
         buy_conditions = [
             metrics.spoof_blocked,  # REQUIRED: Spoof detected
-            metrics.weighted_imbalance >= self.settings.imbalance_buy_threshold,  # REQUIRED: Direction
+            buy_in_range,  # REQUIRED: In winning imbalance range (0.70-1.35)
             buy_confirmations >= 1,  # At least 1 secondary confirmation
             len(self.positions) < self.settings.max_positions_per_pair,
         ]
 
-        # SELL: Spoof confirmed + Imbalance bearish + at least 1 confirmation
-        sell_conditions = [
-            metrics.spoof_blocked,  # REQUIRED: Spoof detected
-            metrics.weighted_imbalance <= self.settings.imbalance_sell_threshold,  # REQUIRED: Direction
-            sell_confirmations >= 1,  # At least 1 secondary confirmation
-            len(self.positions) < self.settings.max_positions_per_pair,
-        ]
+        # SELL: COMPLETELY DISABLED (all SELL signals were losing money)
+        sell_conditions = [False]  # Never triggers
 
         metrics.buy_signal = all(buy_conditions)
-        metrics.sell_signal = all(sell_conditions)
+        metrics.sell_signal = False if self.settings.disable_sell else all(sell_conditions)
         
         return metrics
 
