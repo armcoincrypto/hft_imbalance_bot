@@ -34,6 +34,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # CONFIGURATION
 # =============================================================================
 
+class NumpyEncoder(json.JSONEncoder):
+    """Handle numpy types for JSON serialization."""
+    def default(self, obj):
+        if hasattr(obj, 'item'):  # numpy scalar
+            return obj.item()
+        if hasattr(obj, 'tolist'):  # numpy array
+            return obj.tolist()
+        return super().default(obj)
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -1149,7 +1158,7 @@ class HealthServer:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(json.dumps(parent._debug_info(), indent=2).encode())
+                    self.wfile.write(json.dumps(parent._debug_info(), indent=2, cls=NumpyEncoder).encode())
                 else:
                     self.send_response(404)
                     self.end_headers()
