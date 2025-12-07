@@ -432,8 +432,11 @@ class SymbolState:
             if key not in current_large:
                 if now - order.timestamp <= window_sec:
                     # Spoof detected! This is a POSITIVE signal for trading
+                    # Only log if opening a NEW window (not extending existing)
+                    was_in_window = now < self.spoof_confirmed_until
                     self.spoof_confirmed_until = now + self.settings.spoof_block_seconds
-                    logger.info(f"[{self.symbol}] SPOOF CONFIRMED - trade window open for {self.settings.spoof_block_seconds}s")
+                    if not was_in_window:
+                        logger.info(f"[{self.symbol}] SPOOF CONFIRMED - trade window open for {self.settings.spoof_block_seconds}s")
                 to_remove.append(key)
             elif now - order.timestamp > window_sec:
                 to_remove.append(key)
