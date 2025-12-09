@@ -169,11 +169,11 @@ class FundingArbBot:
     async def fetch_funding_rate(self, symbol: str) -> Optional[FundingData]:
         """Fetch current funding rate for a symbol."""
         try:
-            # MEXC futures symbol format
-            futures_symbol = symbol.replace("/", "")  # BTC/USDT -> BTCUSDT
+            # MEXC futures symbol format: BTC/USDT -> BTC/USDT:USDT
+            futures_symbol = f"{symbol}:USDT"
 
             # Fetch funding rate
-            funding_info = await self.futures_exchange.fetch_funding_rate(symbol)
+            funding_info = await self.futures_exchange.fetch_funding_rate(futures_symbol)
 
             funding_rate = funding_info.get('fundingRate', 0)
             next_funding_time = funding_info.get('fundingTimestamp', time.time() + 28800)
@@ -195,10 +195,13 @@ class FundingArbBot:
     async def fetch_basis(self, symbol: str) -> Optional[BasisData]:
         """Fetch spot and perp prices to calculate basis."""
         try:
+            # MEXC futures symbol format: BTC/USDT -> BTC/USDT:USDT
+            futures_symbol = f"{symbol}:USDT"
+
             # Fetch both prices concurrently
             spot_ticker, perp_ticker = await asyncio.gather(
                 self.spot_exchange.fetch_ticker(symbol),
-                self.futures_exchange.fetch_ticker(symbol)
+                self.futures_exchange.fetch_ticker(futures_symbol)
             )
 
             spot_price = spot_ticker['last']
