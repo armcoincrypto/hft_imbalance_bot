@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     basis_threshold: float = Field(default=0.001)  # 0.1% - enter when perp > spot by this
     basis_exit_threshold: float = Field(default=-0.002)  # -0.2% - exit when perp < spot
     take_profit_basis: float = Field(default=0.0015)  # 0.15% - take profit when basis improves by this
+    take_profit_total: float = Field(default=0.50)  # $0.50 - take profit when total profit (funding + basis) exceeds this
 
     # Position Sizing
     position_size_pct: float = Field(default=0.10)  # 10% of balance per pair
@@ -283,6 +284,15 @@ class FundingArbBot:
         basis_improvement = basis.basis_pct - position.entry_basis
         if basis_improvement >= self.settings.take_profit_basis:
             return True, f"TAKE_PROFIT: Basis improved {basis_improvement*100:.3f}% (Entry: {position.entry_basis*100:.3f}% → Now: {basis.basis_pct*100:.3f}%)"
+
+        # TAKE PROFIT: Exit when total profit (funding + basis) exceeds threshold
+        # Calculate current basis P&L
+        position_value = position.spot_size * basis.spot_price
+        basis_pnl = (basis.basis_pct - position.entry_basis) * position_value
+        total_pnl = position.total_funding_collected + basis_pnl
+
+        if total_pnl >= self.settings.take_profit_total:
+            return True, f"TAKE_PROFIT_TOTAL: ${total_pnl:.2f} (Funding: ${position.total_funding_collected:.2f} + Basis: ${basis_pnl:.2f})"
 
         return False, "Hold"
 
