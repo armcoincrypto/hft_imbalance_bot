@@ -280,15 +280,16 @@ class FundingArbBot:
         if basis.basis_pct < self.settings.basis_exit_threshold:
             return True, f"BASIS_NEGATIVE: {basis.basis_pct:.4f}"
 
-        # TAKE PROFIT: Exit when basis improves by take_profit_basis from entry
-        basis_improvement = basis.basis_pct - position.entry_basis
+        # TAKE PROFIT: Exit when basis converges (improves) by take_profit_basis from entry
+        # We profit when basis DECREASES (perp premium shrinks), so improvement = entry - current
+        basis_improvement = position.entry_basis - basis.basis_pct
         if basis_improvement >= self.settings.take_profit_basis:
-            return True, f"TAKE_PROFIT: Basis improved {basis_improvement*100:.3f}% (Entry: {position.entry_basis*100:.3f}% → Now: {basis.basis_pct*100:.3f}%)"
+            return True, f"TAKE_PROFIT: Basis converged {basis_improvement*100:.3f}% (Entry: {position.entry_basis*100:.3f}% → Now: {basis.basis_pct*100:.3f}%)"
 
         # TAKE PROFIT: Exit when total profit (funding + basis) exceeds threshold
-        # Calculate current basis P&L
+        # Calculate current basis P&L (profit when basis decreases)
         position_value = position.spot_size * basis.spot_price
-        basis_pnl = (basis.basis_pct - position.entry_basis) * position_value
+        basis_pnl = (position.entry_basis - basis.basis_pct) * position_value
         total_pnl = position.total_funding_collected + basis_pnl
 
         if total_pnl >= self.settings.take_profit_total:
