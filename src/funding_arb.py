@@ -335,10 +335,28 @@ class FundingArbBot:
             logger.info(f"  Basis: {basis.basis_pct*100:.3f}% | Funding: {funding.funding_rate*100:.4f}%")
             logger.info(f"  Expected daily funding: ${position_value * funding.estimated_daily_rate:.2f}")
         else:
-            # TODO: Execute actual trades
-            # await self.spot_exchange.create_market_buy_order(symbol, spot_size)
-            # await self.futures_exchange.create_market_sell_order(symbol, perp_size)
-            pass
+            # LIVE MODE: Execute actual trades
+            futures_symbol = f"{symbol}:USDT"
+            try:
+                logger.info(f"[LIVE] [{symbol}] OPENING ARBITRAGE POSITION...")
+
+                # 1. Buy spot
+                logger.info(f"  Buying spot: {spot_size:.6f} {symbol}")
+                spot_order = await self.spot_exchange.create_market_buy_order(symbol, spot_size)
+                logger.info(f"  Spot order filled: {spot_order.get('filled', spot_size)} @ ${spot_order.get('average', basis.spot_price):.2f}")
+
+                # 2. Short perp (sell to open short)
+                logger.info(f"  Shorting perp: {perp_size:.6f} {futures_symbol}")
+                perp_order = await self.futures_exchange.create_market_sell_order(futures_symbol, perp_size)
+                logger.info(f"  Perp order filled: {perp_order.get('filled', perp_size)} @ ${perp_order.get('average', basis.perp_price):.2f}")
+
+                logger.info(f"[LIVE] [{symbol}] POSITION OPENED SUCCESSFULLY")
+                logger.info(f"  Basis: {basis.basis_pct*100:.3f}% | Funding: {funding.funding_rate*100:.4f}%")
+                logger.info(f"  Expected daily funding: ${position_value * funding.estimated_daily_rate:.2f}")
+
+            except Exception as e:
+                logger.error(f"[LIVE] [{symbol}] FAILED TO OPEN POSITION: {e}")
+                return None
 
         position = ArbitragePosition(
             symbol=symbol,
@@ -383,8 +401,30 @@ class FundingArbBot:
             logger.info(f"  Funding P&L: ${funding_pnl:.2f}")
             logger.info(f"  TOTAL P&L: ${total_pnl:.2f}")
         else:
-            # TODO: Execute actual closing trades
-            pass
+            # LIVE MODE: Execute actual closing trades
+            futures_symbol = f"{symbol}:USDT"
+            try:
+                logger.info(f"[LIVE] [{symbol}] CLOSING ARBITRAGE POSITION | {reason}")
+
+                # 1. Sell spot
+                logger.info(f"  Selling spot: {position.spot_size:.6f} {symbol}")
+                spot_order = await self.spot_exchange.create_market_sell_order(symbol, position.spot_size)
+                logger.info(f"  Spot order filled: {spot_order.get('filled', position.spot_size)} @ ${spot_order.get('average', basis.spot_price):.2f}")
+
+                # 2. Close perp short (buy to close)
+                logger.info(f"  Closing perp short: {position.perp_size:.6f} {futures_symbol}")
+                perp_order = await self.futures_exchange.create_market_buy_order(futures_symbol, position.perp_size)
+                logger.info(f"  Perp order filled: {perp_order.get('filled', position.perp_size)} @ ${perp_order.get('average', basis.perp_price):.2f}")
+
+                logger.info(f"[LIVE] [{symbol}] POSITION CLOSED SUCCESSFULLY")
+                logger.info(f"  Duration: {position.age_hours:.1f} hours")
+                logger.info(f"  Basis P&L: ${basis_pnl:.2f}")
+                logger.info(f"  Funding P&L: ${funding_pnl:.2f}")
+                logger.info(f"  TOTAL P&L: ${total_pnl:.2f}")
+
+            except Exception as e:
+                logger.error(f"[LIVE] [{symbol}] FAILED TO CLOSE POSITION: {e}")
+                return None
 
         self.total_basis_profit += basis_pnl
         self.total_funding_collected += funding_pnl
