@@ -43,19 +43,20 @@ class Settings(BaseSettings):
     symbols: str = Field(default="BTC/USDT,ETH/USDT")
 
     # Funding Rate Thresholds
-    funding_threshold: float = Field(default=0.00005)  # 0.005% - enter when above
-    funding_exit_threshold: float = Field(default=-0.00002)  # -0.002% - exit when below
+    funding_threshold: float = Field(default=0.00001)  # 0.001% - enter when above (lowered for more entries)
+    funding_exit_threshold: float = Field(default=-0.0001)  # -0.01% - exit when funding turns significantly negative
 
     # Basis Thresholds (perp premium over spot)
-    basis_threshold: float = Field(default=0.001)  # 0.1% - enter when perp > spot by this
-    basis_exit_threshold: float = Field(default=-0.002)  # -0.2% - exit when perp < spot
-    take_profit_basis: float = Field(default=0.0015)  # 0.15% - take profit when basis improves by this
-    take_profit_total: float = Field(default=0.50)  # $0.50 - take profit when total profit (funding + basis) exceeds this
+    basis_threshold: float = Field(default=-0.003)  # -0.3% - enter when basis above this
+    basis_exit_threshold: float = Field(default=-0.005)  # -0.5% - exit when basis too negative
+    take_profit_basis: float = Field(default=0.01)  # 1% - disabled (set high) - LAZY MODE: hold for funding
+    take_profit_total: float = Field(default=100.0)  # $100 - disabled (set high) - LAZY MODE: hold for funding
+    take_profit_enabled: bool = Field(default=False)  # Disable take profit for lazy mode
 
     # Position Sizing
-    position_size_pct: float = Field(default=0.10)  # 10% of balance per pair
+    position_size_pct: float = Field(default=0.20)  # 20% of balance per pair (increased)
     min_notional: float = Field(default=100.0)  # Minimum $100 position
-    max_position_age_days: int = Field(default=7)  # Max hold time
+    max_position_age_days: int = Field(default=30)  # 30 days max hold (extended for funding collection)
 
     # Rebalancing
     rebalance_interval_sec: int = Field(default=3600)  # 1 hour
@@ -280,22 +281,24 @@ class FundingArbBot:
         if basis.basis_pct < self.settings.basis_exit_threshold:
             return True, f"BASIS_NEGATIVE: {basis.basis_pct:.4f}"
 
-        # TAKE PROFIT: Exit when basis converges (improves) by take_profit_basis from entry
-        # We profit when basis DECREASES (perp premium shrinks), so improvement = entry - current
-        basis_improvement = position.entry_basis - basis.basis_pct
-        if basis_improvement >= self.settings.take_profit_basis:
-            return True, f"TAKE_PROFIT: Basis converged {basis_improvement*100:.3f}% (Entry: {position.entry_basis*100:.3f}% → Now: {basis.basis_pct*100:.3f}%)"
+        # LAZY MODE: Skip take profit checks if disabled (hold for funding collection)
+        if self.settings.take_profit_enabled:
+            # TAKE PROFIT: Exit when basis converges (improves) by take_profit_basis from entry
+            # We profit when basis DECREASES (perp premium shrinks), so improvement = entry - current
+            basis_improvement = position.entry_basis - basis.basis_pct
+            if basis_improvement >= self.settings.take_profit_basis:
+                return True, f"TAKE_PROFIT: Basis converged {basis_improvement*100:.3f}% (Entry: {position.entry_basis*100:.3f}% → Now: {basis.basis_pct*100:.3f}%)"
 
-        # TAKE PROFIT: Exit when total profit (funding + basis) exceeds threshold
-        # Calculate current basis P&L (profit when basis decreases)
-        position_value = position.spot_size * basis.spot_price
-        basis_pnl = (position.entry_basis - basis.basis_pct) * position_value
-        total_pnl = position.total_funding_collected + basis_pnl
+            # TAKE PROFIT: Exit when total profit (funding + basis) exceeds threshold
+            # Calculate current basis P&L (profit when basis decreases)
+            position_value = position.spot_size * basis.spot_price
+            basis_pnl = (position.entry_basis - basis.basis_pct) * position_value
+            total_pnl = position.total_funding_collected + basis_pnl
 
-        if total_pnl >= self.settings.take_profit_total:
-            return True, f"TAKE_PROFIT_TOTAL: ${total_pnl:.2f} (Funding: ${position.total_funding_collected:.2f} + Basis: ${basis_pnl:.2f})"
+            if total_pnl >= self.settings.take_profit_total:
+                return True, f"TAKE_PROFIT_TOTAL: ${total_pnl:.2f} (Funding: ${position.total_funding_collected:.2f} + Basis: ${basis_pnl:.2f})"
 
-        return False, "Hold"
+        return False, "Hold - LAZY MODE (collecting funding)"
 
     async def open_position(self, symbol: str) -> Optional[ArbitragePosition]:
         """Open a delta-neutral arbitrage position."""
@@ -480,11 +483,14 @@ class FundingArbBot:
 
     async def run(self):
         """Main bot loop."""
+        mode = "LAZY MODE" if not self.settings.take_profit_enabled else "ACTIVE MODE"
         logger.info("=" * 60)
-        logger.info(f"Funding Arbitrage Bot v{self.settings.bot_version} [{'DRY_RUN' if self.settings.dry_run else 'LIVE'}]")
+        logger.info(f"Funding Arbitrage Bot v{self.settings.bot_version} [{'DRY_RUN' if self.settings.dry_run else 'LIVE'}] [{mode}]")
         logger.info(f"Symbols: {self.settings.symbol_list}")
         logger.info(f"Funding threshold: {self.settings.funding_threshold*100:.4f}%")
         logger.info(f"Basis threshold: {self.settings.basis_threshold*100:.2f}%")
+        logger.info(f"Position size: {self.settings.position_size_pct*100:.0f}% | Max hold: {self.settings.max_position_age_days} days")
+        logger.info(f"Take profit: {'DISABLED (hold for funding)' if not self.settings.take_profit_enabled else f'${self.settings.take_profit_total}'}")
         logger.info("=" * 60)
 
         await self.initialize()
