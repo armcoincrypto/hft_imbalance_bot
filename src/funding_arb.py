@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     )
 
     dry_run: bool = Field(default=True)
-    mexc_api_key: str = Field(default="")
-    mexc_api_secret: str = Field(default="")
+    bybit_api_key: str = Field(default="")
+    bybit_api_secret: str = Field(default="")
     symbols: str = Field(default="BTC/USDT,ETH/USDT")
 
     # Funding Rate Thresholds
@@ -137,22 +137,22 @@ class FundingArbBot:
 
     async def initialize(self):
         """Initialize exchange connections."""
-        logger.info("Initializing exchanges...")
+        logger.info("Initializing Bybit exchanges...")
 
         # Spot exchange
-        self.spot_exchange = ccxt.mexc({
-            'apiKey': self.settings.mexc_api_key,
-            'secret': self.settings.mexc_api_secret,
+        self.spot_exchange = ccxt.bybit({
+            'apiKey': self.settings.bybit_api_key,
+            'secret': self.settings.bybit_api_secret,
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
         })
 
-        # Futures exchange
-        self.futures_exchange = ccxt.mexc({
-            'apiKey': self.settings.mexc_api_key,
-            'secret': self.settings.mexc_api_secret,
+        # Futures exchange (linear perpetuals)
+        self.futures_exchange = ccxt.bybit({
+            'apiKey': self.settings.bybit_api_key,
+            'secret': self.settings.bybit_api_secret,
             'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
+            'options': {'defaultType': 'linear'}  # Bybit uses 'linear' for USDT perpetuals
         })
 
         await self.spot_exchange.load_markets()
