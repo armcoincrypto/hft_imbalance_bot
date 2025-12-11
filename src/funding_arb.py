@@ -228,13 +228,23 @@ class FundingArbBot:
             return None
 
     async def get_balance(self) -> float:
-        """Get available USDT balance."""
+        """Get available USDT balance from SPOT wallet (for buying spot positions)."""
         try:
             if self.settings.dry_run:
                 return 10000.0  # Simulated balance
 
-            balance = await self.futures_exchange.fetch_balance()
-            return balance.get('USDT', {}).get('free', 0)
+            # Check SPOT balance (we need USDT there to buy spot)
+            spot_balance = await self.spot_exchange.fetch_balance()
+            spot_usdt = spot_balance.get('USDT', {}).get('free', 0)
+
+            # Also log futures balance for info
+            futures_balance = await self.futures_exchange.fetch_balance()
+            futures_usdt = futures_balance.get('USDT', {}).get('free', 0)
+
+            logger.info(f"Balance - Spot: ${spot_usdt:.2f} | Futures: ${futures_usdt:.2f}")
+
+            # Use spot balance for position sizing (we buy spot first)
+            return spot_usdt
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
             return 0
