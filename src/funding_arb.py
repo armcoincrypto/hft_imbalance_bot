@@ -125,8 +125,8 @@ class ArbitragePosition:
 class FundingArbBot:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.spot_exchange: Optional[ccxt.mexc] = None
-        self.futures_exchange: Optional[ccxt.mexc] = None
+        self.spot_exchange: Optional[ccxt.bybit] = None
+        self.futures_exchange: Optional[ccxt.bybit] = None
         self.positions: dict[str, ArbitragePosition] = {}
         self.funding_data: dict[str, FundingData] = {}
         self.basis_data: dict[str, BasisData] = {}
@@ -134,6 +134,20 @@ class FundingArbBot:
         self._start_time = time.time()
         self.total_funding_collected = 0.0
         self.total_basis_profit = 0.0
+
+    def round_to_precision(self, amount: float, symbol: str, is_spot: bool = True) -> float:
+        """Round amount to exchange precision requirements."""
+        try:
+            exchange = self.spot_exchange if is_spot else self.futures_exchange
+            market_symbol = symbol if is_spot else f"{symbol}:USDT"
+            market = exchange.market(market_symbol)
+            precision = market.get('precision', {}).get('amount', 8)
+            if isinstance(precision, int):
+                return round(amount, precision)
+            return float(exchange.amount_to_precision(market_symbol, amount))
+        except Exception:
+            # Default to 6 decimal places if precision lookup fails
+            return round(amount, 6)
 
     async def initialize(self):
         """Initialize exchange connections."""
@@ -160,6 +174,17 @@ class FundingArbBot:
 
         logger.info(f"Spot markets loaded: {len(self.spot_exchange.markets)}")
         logger.info(f"Futures markets loaded: {len(self.futures_exchange.markets)}")
+
+        # Set leverage for futures (low leverage for safety)
+        if not self.settings.dry_run:
+            for symbol in self.settings.symbol_list:
+                try:
+                    futures_symbol = f"{symbol}:USDT"
+                    # Set to 1x leverage (no leverage) for delta-neutral strategy
+                    await self.futures_exchange.set_leverage(1, futures_symbol)
+                    logger.info(f"[{symbol}] Leverage set to 1x")
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Could not set leverage: {e}")
 
     async def close(self):
         """Close exchange connections."""
@@ -328,6 +353,10 @@ class FundingArbBot:
         spot_size = position_value / basis.spot_price
         perp_size = position_value / basis.perp_price
 
+        # Round to exchange precision
+        spot_size = self.round_to_precision(spot_size, symbol, is_spot=True)
+        perp_size = self.round_to_precision(perp_size, symbol, is_spot=False)
+
         if self.settings.dry_run:
             logger.info(f"[DRY_RUN] [{symbol}] OPEN ARBITRAGE POSITION")
             logger.info(f"  LONG SPOT:  {spot_size:.6f} @ ${basis.spot_price:.2f}")
@@ -337,25 +366,48 @@ class FundingArbBot:
         else:
             # LIVE MODE: Execute actual trades
             futures_symbol = f"{symbol}:USDT"
+            spot_order = None
+            perp_order = None
             try:
                 logger.info(f"[LIVE] [{symbol}] OPENING ARBITRAGE POSITION...")
 
                 # 1. Buy spot
                 logger.info(f"  Buying spot: {spot_size:.6f} {symbol}")
                 spot_order = await self.spot_exchange.create_market_buy_order(symbol, spot_size)
-                logger.info(f"  Spot order filled: {spot_order.get('filled', spot_size)} @ ${spot_order.get('average', basis.spot_price):.2f}")
+                actual_spot_size = float(spot_order.get('filled', spot_size))
+                spot_avg_price = float(spot_order.get('average', basis.spot_price))
+                logger.info(f"  ✅ Spot order filled: {actual_spot_size:.6f} @ ${spot_avg_price:.2f}")
 
-                # 2. Short perp (sell to open short)
+                # 2. Short perp (sell to open short) - match spot size for delta neutral
+                perp_size = self.round_to_precision(actual_spot_size, symbol, is_spot=False)
                 logger.info(f"  Shorting perp: {perp_size:.6f} {futures_symbol}")
                 perp_order = await self.futures_exchange.create_market_sell_order(futures_symbol, perp_size)
-                logger.info(f"  Perp order filled: {perp_order.get('filled', perp_size)} @ ${perp_order.get('average', basis.perp_price):.2f}")
+                actual_perp_size = float(perp_order.get('filled', perp_size))
+                perp_avg_price = float(perp_order.get('average', basis.perp_price))
+                logger.info(f"  ✅ Perp order filled: {actual_perp_size:.6f} @ ${perp_avg_price:.2f}")
 
-                logger.info(f"[LIVE] [{symbol}] POSITION OPENED SUCCESSFULLY")
+                # Update sizes with actual filled amounts
+                spot_size = actual_spot_size
+                perp_size = actual_perp_size
+
+                logger.info(f"[LIVE] [{symbol}] ✅ POSITION OPENED SUCCESSFULLY")
                 logger.info(f"  Basis: {basis.basis_pct*100:.3f}% | Funding: {funding.funding_rate*100:.4f}%")
                 logger.info(f"  Expected daily funding: ${position_value * funding.estimated_daily_rate:.2f}")
 
             except Exception as e:
-                logger.error(f"[LIVE] [{symbol}] FAILED TO OPEN POSITION: {e}")
+                logger.error(f"[LIVE] [{symbol}] ❌ FAILED TO OPEN POSITION: {e}")
+
+                # If spot was filled but perp failed, try to sell spot to unwind
+                if spot_order and not perp_order:
+                    try:
+                        logger.warning(f"[LIVE] [{symbol}] Unwinding spot position...")
+                        filled = float(spot_order.get('filled', 0))
+                        if filled > 0:
+                            await self.spot_exchange.create_market_sell_order(symbol, filled)
+                            logger.info(f"[LIVE] [{symbol}] Spot position unwound")
+                    except Exception as unwind_error:
+                        logger.error(f"[LIVE] [{symbol}] ❌ CRITICAL: Failed to unwind spot: {unwind_error}")
+                        logger.error(f"[LIVE] [{symbol}] Manual intervention required!")
                 return None
 
         position = ArbitragePosition(
@@ -403,27 +455,36 @@ class FundingArbBot:
         else:
             # LIVE MODE: Execute actual closing trades
             futures_symbol = f"{symbol}:USDT"
+            spot_order = None
+            perp_order = None
             try:
                 logger.info(f"[LIVE] [{symbol}] CLOSING ARBITRAGE POSITION | {reason}")
 
+                # Round position sizes to precision
+                spot_size_rounded = self.round_to_precision(position.spot_size, symbol, is_spot=True)
+                perp_size_rounded = self.round_to_precision(position.perp_size, symbol, is_spot=False)
+
                 # 1. Sell spot
-                logger.info(f"  Selling spot: {position.spot_size:.6f} {symbol}")
-                spot_order = await self.spot_exchange.create_market_sell_order(symbol, position.spot_size)
-                logger.info(f"  Spot order filled: {spot_order.get('filled', position.spot_size)} @ ${spot_order.get('average', basis.spot_price):.2f}")
+                logger.info(f"  Selling spot: {spot_size_rounded:.6f} {symbol}")
+                spot_order = await self.spot_exchange.create_market_sell_order(symbol, spot_size_rounded)
+                logger.info(f"  ✅ Spot sold: {spot_order.get('filled', spot_size_rounded)} @ ${float(spot_order.get('average', basis.spot_price)):.2f}")
 
                 # 2. Close perp short (buy to close)
-                logger.info(f"  Closing perp short: {position.perp_size:.6f} {futures_symbol}")
-                perp_order = await self.futures_exchange.create_market_buy_order(futures_symbol, position.perp_size)
-                logger.info(f"  Perp order filled: {perp_order.get('filled', position.perp_size)} @ ${perp_order.get('average', basis.perp_price):.2f}")
+                logger.info(f"  Closing perp short: {perp_size_rounded:.6f} {futures_symbol}")
+                perp_order = await self.futures_exchange.create_market_buy_order(futures_symbol, perp_size_rounded)
+                logger.info(f"  ✅ Perp closed: {perp_order.get('filled', perp_size_rounded)} @ ${float(perp_order.get('average', basis.perp_price)):.2f}")
 
-                logger.info(f"[LIVE] [{symbol}] POSITION CLOSED SUCCESSFULLY")
+                logger.info(f"[LIVE] [{symbol}] ✅ POSITION CLOSED SUCCESSFULLY")
                 logger.info(f"  Duration: {position.age_hours:.1f} hours")
                 logger.info(f"  Basis P&L: ${basis_pnl:.2f}")
                 logger.info(f"  Funding P&L: ${funding_pnl:.2f}")
                 logger.info(f"  TOTAL P&L: ${total_pnl:.2f}")
 
             except Exception as e:
-                logger.error(f"[LIVE] [{symbol}] FAILED TO CLOSE POSITION: {e}")
+                logger.error(f"[LIVE] [{symbol}] ❌ FAILED TO CLOSE POSITION: {e}")
+                if spot_order and not perp_order:
+                    logger.error(f"[LIVE] [{symbol}] ❌ WARNING: Spot sold but perp still open!")
+                    logger.error(f"[LIVE] [{symbol}] Manual intervention required to close perp!")
                 return None
 
         self.total_basis_profit += basis_pnl
