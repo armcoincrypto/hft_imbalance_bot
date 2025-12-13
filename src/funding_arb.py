@@ -374,16 +374,22 @@ class FundingArbBot:
                 # 1. Buy spot
                 logger.info(f"  Buying spot: {spot_size:.6f} {symbol}")
                 spot_order = await self.spot_exchange.create_market_buy_order(symbol, spot_size)
-                actual_spot_size = float(spot_order.get('filled', spot_size))
-                spot_avg_price = float(spot_order.get('average', basis.spot_price))
+                logger.info(f"  Spot order response: {spot_order.get('id', 'unknown')}")
+                actual_spot_size = spot_order.get('filled') or spot_order.get('amount') or spot_size
+                actual_spot_size = float(actual_spot_size) if actual_spot_size else spot_size
+                spot_avg_price = spot_order.get('average') or spot_order.get('price') or basis.spot_price
+                spot_avg_price = float(spot_avg_price) if spot_avg_price else basis.spot_price
                 logger.info(f"  ✅ Spot order filled: {actual_spot_size:.6f} @ ${spot_avg_price:.2f}")
 
                 # 2. Short perp (sell to open short) - match spot size for delta neutral
                 perp_size = self.round_to_precision(actual_spot_size, symbol, is_spot=False)
                 logger.info(f"  Shorting perp: {perp_size:.6f} {futures_symbol}")
                 perp_order = await self.futures_exchange.create_market_sell_order(futures_symbol, perp_size)
-                actual_perp_size = float(perp_order.get('filled', perp_size))
-                perp_avg_price = float(perp_order.get('average', basis.perp_price))
+                logger.info(f"  Perp order response: {perp_order.get('id', 'unknown')}")
+                actual_perp_size = perp_order.get('filled') or perp_order.get('amount') or perp_size
+                actual_perp_size = float(actual_perp_size) if actual_perp_size else perp_size
+                perp_avg_price = perp_order.get('average') or perp_order.get('price') or basis.perp_price
+                perp_avg_price = float(perp_avg_price) if perp_avg_price else basis.perp_price
                 logger.info(f"  ✅ Perp order filled: {actual_perp_size:.6f} @ ${perp_avg_price:.2f}")
 
                 # Update sizes with actual filled amounts
@@ -401,7 +407,8 @@ class FundingArbBot:
                 if spot_order and not perp_order:
                     try:
                         logger.warning(f"[LIVE] [{symbol}] Unwinding spot position...")
-                        filled = float(spot_order.get('filled', 0))
+                        filled = spot_order.get('filled') or spot_order.get('amount') or spot_size
+                        filled = float(filled) if filled else spot_size
                         if filled > 0:
                             await self.spot_exchange.create_market_sell_order(symbol, filled)
                             logger.info(f"[LIVE] [{symbol}] Spot position unwound")
